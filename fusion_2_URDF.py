@@ -1,4 +1,19 @@
+"""
+Fusion_to_URDF
+==============
+Exports the active Fusion design to a URDF package (urdf + STL meshes).
 
+Flow:
+  1. CHECK  - reads the whole design and lists everything that would break a URDF,
+              each with the exact fix. If there are errors, nothing is exported.
+  2. EXPORT - if the design passes, it writes the URDF and meshes.
+  3. VERIFY - re-reads the written URDF and checks it.
+  4. If anything fails at any stage, a report says which stage / which part failed,
+     why that usually happens, and what to correct.
+
+It NEVER modifies your design (no renaming, no copying components).
+Units: Fusion API = cm / kg. URDF = metres / kg.
+"""
 import adsk.core, adsk.fusion, traceback, re, os, math, struct, datetime
 from collections import deque
 from xml.etree import ElementTree as ET
@@ -140,12 +155,28 @@ def stl_bounds(path):
     return mn, mx
 
 
-def mesh_placement(stl_path, occ, link_world, rep, link_name):
-    """Returns (scale_to_metres, visual_origin_in_link_frame)."""
+def rpy_from_matrix(R):
+    pitch = -math.asin(max(-1.0, min(1.0, R[2][0])))
+    if abs(math.cos(pitch)) > 1e-6:
+        roll = math.atan2(R[2][1], R[2][2])
+        yaw = math.atan2(R[1][0], R[0][0])
+    else:
+        roll = 0.0
+        yaw = math.atan2(-R[0][1], R[1][1])
+    return (roll, pitch, yaw)
+
+
+def mesh_placement(stl_path, occ, link_world):
+    """
+    Returns (scale_to_metres, visual_xyz, visual_rpy, mode)
+    mode: 'world'    mesh is already in assembly coordinates
+          'local'    mesh is in the part's own frame; placed with the part's transform (position + rotation)
+          'fallback' could not be matched; re-centred by bounding box (rotation not handled)
+    """
     bb = occ.boundingBox
-    wmin = (bb.minPoint.x, bb.minPoint.y, bb.minPoint.z)
-    wmax = (bb.maxPoint.x, bb.maxPoint.y, bb.maxPoint.z)
-    ext_w = max(wmax[i] - wmin[i] for i in range(3)) * 0.01
+    wmin = [bb.minPoint.x * 0.01, bb.minPoint.y * 0.01, bb.minPoint.z * 0.01]
+    wmax = [bb.maxPoint.x * 0.01, bb.maxPoint.y * 0.01, bb.maxPoint.z * 0.01]
+    ext_w = max(wmax[i] - wmin[i] for i in range(3))
     smin, smax = stl_bounds(stl_path)
     ext_s = max(smax[i] - smin[i] for i in range(3))
     if ext_s <= 0:
@@ -155,18 +186,35 @@ def mesh_placement(stl_path, occ, link_world, rep, link_name):
         scale = min([1.0, 0.1, 0.01, 0.001], key=lambda s: abs(math.log(ratio / s)))
     else:
         scale = 0.001
-        rep.warn('Could not read the size of "%s" to detect mesh units; assumed millimetres.' % link_name)
+    tol = 0.03 * ext_w + 0.002
+
+    def close(lo, hi):
+        return all(abs(lo[i] - wmin[i]) <= tol and abs(hi[i] - wmax[i]) <= tol for i in range(3))
+
+    # 1) mesh already in world coordinates?
+    lo = [smin[i] * scale for i in range(3)]
+    hi = [smax[i] * scale for i in range(3)]
+    if close(lo, hi):
+        return scale, [-link_world[i] for i in range(3)], [0.0, 0.0, 0.0], 'world'
+
+    # 2) mesh in the part's own frame: world = R * local + t
+    T = occ.transform
+    R = [[T.getCell(r, c) for c in range(3)] for r in range(3)]
+    t = [T.getCell(r, 3) * 0.01 for r in range(3)]
+    xs = (smin[0] * scale, smax[0] * scale)
+    ys = (smin[1] * scale, smax[1] * scale)
+    zs = (smin[2] * scale, smax[2] * scale)
+    pts = [[R[r][0] * x + R[r][1] * y + R[r][2] * z + t[r] for r in range(3)]
+           for x in xs for y in ys for z in zs]
+    lo2 = [min(p[i] for p in pts) for i in range(3)]
+    hi2 = [max(p[i] for p in pts) for i in range(3)]
+    if close(lo2, hi2):
+        return scale, [t[i] - link_world[i] for i in range(3)], list(rpy_from_matrix(R)), 'local'
+
+    # 3) fallback: centre by bounding box (position only)
     mc = [(smin[i] + smax[i]) / 2.0 * scale for i in range(3)]
-    wc = [(wmin[i] + wmax[i]) / 2.0 * 0.01 for i in range(3)]
-    diff = max(abs(mc[i] - wc[i]) for i in range(3))
-    if diff <= 0.05 * ext_w + 0.002:
-        return scale, [-link_world[i] for i in range(3)]
-    rep.warn('The mesh for "%s" was exported in a different position than expected '
-             '(%.1f mm off). I re-centred it using its bounding box, so it should look '
-             'right unless the part is rotated.' % (link_name, diff * 1000),
-             'Check the mesh in a URDF viewer. If it is misplaced, make sure the component '
-             'is not rotated/moved after being created inside another component.')
-    return scale, [wc[i] - link_world[i] - mc[i] for i in range(3)]
+    wc = [(wmin[i] + wmax[i]) / 2.0 for i in range(3)]
+    return scale, [wc[i] - link_world[i] - mc[i] for i in range(3)], [0.0, 0.0, 0.0], 'fallback'
 
 
 # ----------------------------- STAGE 1: CHECK ------------------------
@@ -426,6 +474,7 @@ def export(design, model, outdir, rep, st):
         jinfo[child] = {'parent': parent, 'e': e, 'axis': axis, 'lo': lo, 'hi': hi}
 
     data = {}
+    modes = {}
     em = design.exportManager
     q = {'Low': adsk.fusion.MeshRefinementSettings.MeshRefinementLow,
          'Medium': adsk.fusion.MeshRefinementSettings.MeshRefinementMedium,
@@ -483,8 +532,9 @@ def export(design, model, outdir, rep, st):
                     os.replace(alt, path)
                 else:
                     raise RuntimeError('mesh file was not created')
-            scale, vis = mesh_placement(path, occ, lw, rep, name)
-            d.update(scale=scale, vis=vis)
+            scale, vis, vrpy, mode = mesh_placement(path, occ, lw)
+            d.update(scale=scale, vis=vis, vis_rpy=vrpy)
+            modes.setdefault(mode, []).append(name)
             data[name] = d
         except Exception as ex:
             rep.error('The mesh for "%s" could not be exported (%s).' % (name, ex),
@@ -493,6 +543,15 @@ def export(design, model, outdir, rep, st):
 
     if rep.errors:
         return None
+    if modes.get('local'):
+        rep.info('%d mesh(es) were exported in each part\'s own frame; they were placed using the '
+                 'part\'s position and rotation in the assembly.' % len(modes['local']))
+    if modes.get('fallback'):
+        rep.warn('The position of %d mesh(es) could not be matched to the assembly, so they were '
+                 'centred by bounding box only (rotation ignored): %s'
+                 % (len(modes['fallback']), ', '.join(modes['fallback'])),
+                 'Open the URDF in a viewer. If these parts look rotated or misplaced, tell me and '
+                 'send the report.')
 
     st['stage'], st['item'] = 'writing the URDF files', ''
     for suffix, prefix in (('', 'package://%s/meshes/' % pkg), ('_relative', '../meshes/')):
@@ -516,7 +575,7 @@ def build_urdf(model, data, link_world, jinfo, prefix):
         ET.SubElement(inr, 'inertia', {k: fmt(d[k]) for k in ('ixx', 'ixy', 'ixz', 'iyy', 'iyz', 'izz')})
         for tag in ('visual', 'collision'):
             el = ET.SubElement(link, tag)
-            ET.SubElement(el, 'origin', {'xyz': vec(d['vis']), 'rpy': '0 0 0'})
+            ET.SubElement(el, 'origin', {'xyz': vec(d['vis']), 'rpy': vec(d['vis_rpy'])})
             g = ET.SubElement(el, 'geometry')
             s = fmt(d['scale'])
             ET.SubElement(g, 'mesh', {'filename': prefix + name + '.stl', 'scale': '%s %s %s' % (s, s, s)})
